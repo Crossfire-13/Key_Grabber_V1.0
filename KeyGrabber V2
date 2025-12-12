@@ -1,0 +1,25 @@
+const int buttonPin = 7;  // pushbutton pin
+const int ledPin = 13;    // onboard LED
+
+int buttonState = 0;
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP); // enable internal pull-up resistor
+  Serial.begin(115200);             // initialize Serial Monitor
+}
+
+void loop() {
+  // read button state (LOW when pressed because of pull-up)
+  buttonState = digitalRead(buttonPin);
+
+  if (buttonState == LOW) {
+    digitalWrite(ledPin, HIGH);      // turn LED on
+    Serial.println("Button Pressed");
+  } else {
+    digitalWrite(ledPin, LOW);       // turn LED off
+    Serial.println("Button Released");
+  }
+
+  delay(50); // small debounce delay
+}
