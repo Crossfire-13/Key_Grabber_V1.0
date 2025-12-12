@@ -1,0 +1,419 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h> 
+#include <Adafruit_PWMServoDriver.h> 
+
+// --- WiFi Configuration (MUST BE UPDATED) ---
+const char* ssid = "Dulana's Galaxy S23 Ultra";
+const char* password = "Dulnex2003";
+AsyncWebServer server(80);
+
+// --- PCA9685 Configuration ---
+const uint8_t PCA9685_ADDRESS = 0x40; 
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDRESS); 
+
+// --- Servo Configuration ---
+const uint8_t NUM_SERVOS = 6;
+const uint8_t servoChannels[NUM_SERVOS] = {0, 1, 2, 3, 4, 5}; 
+const int PULSE_CENTER = 1500; 
+
+// --- PCA9685 Constants ---
+#define SERVOMIN_COUNT  70      
+#define SERVOMAX_COUNT  530     
+#define SERVO_HZ        50      
+
+// --- Pin Definitions (ESP32-C3 Supermini) ---
+const int ON_LED_PIN = 5;      // ON LED (Pin 5) - Always ON when powered
+const int STATUS_LED_PIN = 7;  // STATUS LED (Pin 7) - Indicates WiFi Connected/Recording
+
+// --- Robot State & Record/Playback ---
+int motor_locs[NUM_SERVOS] = {PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER}; 
+const int MAX_POSITIONS = 50;
+int recordedPositions[MAX_POSITIONS][NUM_SERVOS]; // Stores pulse widths
+int positionCount = 0;
+bool isRecording = false;
+
+// --- Function Prototypes ---
+void homeAllServos();
+void sendServoPulse(uint8_t channel, int pulseWidth_us); 
+void playBackPositions();
+void handleWebSocketData(AsyncWebSocketClient *client, void *arg, uint8_t *data, size_t len);
+
+// Create a WebSocket object
+AsyncWebSocket ws("/ws");
+
+// ---------------------------------------------------------------------------------
+// ---------------------------- EMBEDDED WEBPAGE (HTML/JS) -------------------------
+// ---------------------------------------------------------------------------------
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Arm WiFi Controller</title>
+<style>
+  body { font-family: Arial, sans-serif; text-align: center; background-color: #f0f0f0; }
+  .container { max-width: 600px; margin: auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+  .joystick-container { display: flex; justify-content: space-around; margin-bottom: 20px; }
+  .joystick { width: 150px; height: 150px; background-color: #eee; border-radius: 50%; position: relative; border: 3px solid #333; }
+  .joystick-handle { width: 40px; height: 40px; background-color: #c00; border-radius: 50%; position: absolute; transform: translate(-50%, -50%); cursor: grab; }
+  button { padding: 10px 20px; font-size: 16px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; }
+  #record-btn { background-color: #ffc107; }
+  #play-btn { background-color: #28a745; color: white; }
+  #status { margin-top: 10px; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Robot Arm Web Control</h1>
+  
+  <div class="joystick-container">
+    <div>
+      <h3>Base / Shoulder (J1)</h3>
+      <canvas id="joystick1" class="joystick" width="150" height="150"></canvas>
+      <p>X: <span id="x1_val">512</span> | Y: <span id="y1_val">512</span></p>
+    </div>
+    
+    <div>
+      <h3>Elbow / Wrist Rotate (J2)</h3>
+      <canvas id="joystick2" class="joystick" width="150" height="150"></canvas>
+      <p>X: <span id="x2_val">512</span> | Y: <span id="y2_val">512</span></p>
+    </div>
+  </div>
+  
+  <button id="record-btn">START RECORDING</button>
+  <button id="play-btn">PLAY BACK</button>
+  
+  <div id="status">Status: Connecting...</div>
+</div>
+
+<script>
+var connection = new WebSocket('ws://' + location.hostname + '/ws');
+var isRecording = false;
+
+connection.onopen = function () {
+  document.getElementById('status').innerText = 'Status: Connected';
+};
+connection.onerror = function (error) {
+  document.getElementById('status').innerText = 'Status: Error - Disconnected';
+};
+
+// --- Joystick Setup ---
+const joysticks = [
+  { id: 1, canvas: document.getElementById('joystick1'), x_val: 512, y_val: 512 },
+  { id: 2, canvas: document.getElementById('joystick2'), x_val: 512, y_val: 512 }
+];
+
+const centerX = 75;
+const centerY = 75;
+const radius = 60;
+let activeJoystick = null;
+
+function drawJoystick(j) {
+  const ctx = j.canvas.getContext('2d');
+  ctx.clearRect(0, 0, 150, 150);
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  const handleX = centerX + (j.x_val - 512) * radius / 512;
+  const handleY = centerY - (j.y_val - 512) * radius / 512;
+  
+  ctx.beginPath();
+  ctx.arc(handleX, handleY, 15, 0, 2 * Math.PI);
+  ctx.fillStyle = '#c00';
+  ctx.fill();
+}
+
+function updateValues() {
+  const x1 = joysticks[0].x_val;
+  const y1 = joysticks[0].y_val;
+  const x2 = joysticks[1].x_val;
+  const y2 = joysticks[1].y_val;
+
+  document.getElementById('x1_val').innerText = x1;
+  document.getElementById('y1_val').innerText = y1;
+  document.getElementById('x2_val').innerText = x2;
+  document.getElementById('y2_val').innerText = y2;
+  
+  // Send data to ESP32: J:X1,Y1,X2,Y2
+  if (connection.readyState === connection.OPEN) {
+    // Send data roughly 10 times per second for smooth movement
+    setTimeout(() => {
+        connection.send(`J:${x1},${y1},${x2},${y2}`);
+    }, 100);
+  }
+}
+
+// --- Event Listeners for Touch/Mouse ---
+
+function getCoords(e, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX || e.touches[0].clientX) - rect.left;
+  const y = (e.clientY || e.touches[0].clientY) - rect.top;
+  return { x, y };
+}
+
+function handleStart(e, j) {
+  e.preventDefault();
+  activeJoystick = j;
+  document.addEventListener('mousemove', handleMove);
+  document.addEventListener('mouseup', handleEnd);
+  document.addEventListener('touchmove', handleMove);
+  document.addEventListener('touchend', handleEnd);
+}
+
+function handleMove(e) {
+  if (!activeJoystick) return;
+  const coords = getCoords(e.clientX ? e : e.touches[0], activeJoystick.canvas);
+  
+  let dx = coords.x - centerX;
+  let dy = coords.y - centerY;
+  
+  // Clamp movement to the radius
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist > radius) {
+    dx *= radius / dist;
+    dy *= radius / dist;
+  }
+  
+  // Map movement (-radius to +radius) to Joystick values (0 to 1023)
+  activeJoystick.x_val = Math.round(512 + dx * 512 / radius); 
+  // Y-axis (0: Up, 1023: Down)
+  activeJoystick.y_val = Math.round(512 - dy * 512 / radius); 
+
+  drawJoystick(activeJoystick);
+  updateValues();
+}
+
+function handleEnd() {
+  if (!activeJoystick) return;
+  
+  // Snap back to center (512, 512)
+  activeJoystick.x_val = 512;
+  activeJoystick.y_val = 512;
+  drawJoystick(activeJoystick);
+  updateValues();
+
+  document.removeEventListener('mousemove', handleMove);
+  document.removeEventListener('mouseup', handleEnd);
+  document.removeEventListener('touchmove', handleMove);
+  document.removeEventListener('touchend', handleEnd);
+  activeJoystick = null;
+}
+
+// Initialize joysticks and attach listeners
+joysticks.forEach(j => {
+  drawJoystick(j);
+  j.canvas.addEventListener('mousedown', (e) => handleStart(e, j));
+  j.canvas.addEventListener('touchstart', (e) => handleStart(e, j));
+});
+
+// --- Button Logic (Maps to Digital Input State) ---
+document.getElementById('record-btn').addEventListener('click', function() {
+  if (isRecording) {
+    // If Recording is currently active (like buttonState == LOW)
+    isRecording = false;
+    this.innerText = "START RECORDING";
+    this.style.backgroundColor = '#ffc107';
+    if (connection.readyState === connection.OPEN) connection.send("REC_STOP"); // Send STOP command
+    console.log("Button Released: REC_STOP");
+    
+  } else {
+    // If Recording is currently inactive (like buttonState == HIGH)
+    isRecording = true;
+    this.innerText = "STOP RECORDING";
+    this.style.backgroundColor = '#dc3545';
+    if (connection.readyState === connection.OPEN) connection.send("REC_START"); // Send START command
+    console.log("Button Pressed: REC_START");
+  }
+});
+
+document.getElementById('play-btn').addEventListener('click', function() {
+  if (connection.readyState === connection.OPEN) connection.send("PLAY");
+  document.getElementById('status').innerText = 'Status: Playing back steps...';
+});
+
+</script>
+</body>
+</html>
+)rawliteral";
+
+
+// ---------------------------------------------------------------------------------
+// ------------------------------ SETUP --------------------------------------------
+// ---------------------------------------------------------------------------------
+
+void setup() {
+    Serial.begin(115200);
+
+    // --- Pin Setup ---
+    pinMode(ON_LED_PIN, OUTPUT);
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(ON_LED_PIN, HIGH); // ON LED (Pin 5) should always be on
+    digitalWrite(STATUS_LED_PIN, LOW);
+
+    // --- PCA9685 Initialization ---
+    Wire.begin(); 
+    pwm.begin();
+    pwm.setPWMFreq(SERVO_HZ);
+    homeAllServos();
+    
+    // --- WiFi Setup ---
+    Serial.printf("Connecting to %s ", ssid);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected.");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        digitalWrite(STATUS_LED_PIN, HIGH); // STATUS LED (Pin 7) ON when connected
+    } else {
+        Serial.println("\nWiFi connection failed. Check credentials.");
+        digitalWrite(STATUS_LED_PIN, LOW); 
+    }
+
+    // --- Web Server Setup ---
+    ws.onEvent([](AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+        if(type == WS_EVT_CONNECT){
+            Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+        } else if(type == WS_EVT_DISCONNECT){
+            Serial.printf("WebSocket client #%u disconnected\n", client->id());
+        } else if(type == WS_EVT_DATA){
+            handleWebSocketData(client, arg, data, len);
+        }
+    });
+    server.addHandler(&ws);
+
+    // Serve the HTML page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", index_html);
+    });
+
+    server.begin();
+}
+
+// ---------------------------------------------------------------------------------
+// ------------------------------ LOOP ---------------------------------------------
+// ---------------------------------------------------------------------------------
+
+void loop() {
+    // --- Record Logic (Similar to reading physical button state constantly) ---
+    if (isRecording) { // If recording state is HIGH
+        static int lastRecordedPosition[NUM_SERVOS] = {PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER, PULSE_CENTER};
+        bool significantChange = false;
+        
+        // Check only the channels controlled by joysticks (0-3)
+        for (int i = 0; i < 4; i++) { 
+            if (abs(motor_locs[i] - lastRecordedPosition[i]) > 10) { 
+                significantChange = true;
+                break;
+            }
+        }
+
+        if (significantChange && positionCount < MAX_POSITIONS) {
+            for (int i = 0; i < NUM_SERVOS; i++) {
+                recordedPositions[positionCount][i] = motor_locs[i];
+                lastRecordedPosition[i] = motor_locs[i];
+            }
+            positionCount++;
+            // Blink STATUS LED while recording
+            digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN)); 
+        }
+    }
+    
+    // Maintain STATUS LED state when not recording
+    if (!isRecording && WiFi.status() == WL_CONNECTED) {
+        digitalWrite(STATUS_LED_PIN, HIGH);
+    }
+    
+    ws.cleanupClients();
+    delay(10); 
+}
+
+// ---------------------------------------------------------------------------------
+// ------------------------------ FUNCTIONS ----------------------------------------
+// ---------------------------------------------------------------------------------
+
+void homeAllServos() {
+    for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+        sendServoPulse(servoChannels[i], PULSE_CENTER);
+    }
+}
+
+void sendServoPulse(uint8_t channel, int pulseWidth_us) {
+    long pulse_length = map(pulseWidth_us, 500, 2500, SERVOMIN_COUNT, SERVOMAX_COUNT);
+    pwm.setPWM(channel, 0, pulse_length);
+}
+
+void playBackPositions() {
+    Serial.printf("Starting Playback of %d positions.\n", positionCount);
+    digitalWrite(STATUS_LED_PIN, LOW); // LED OFF during playback
+    
+    for (int i = 0; i < positionCount; i++) {
+        for (int j = 0; j < NUM_SERVOS; j++) {
+            sendServoPulse(servoChannels[j], recordedPositions[i][j]);
+        }
+        delay(100); // Wait time between steps 
+    }
+    
+    digitalWrite(STATUS_LED_PIN, HIGH); // LED ON after playback
+    Serial.println("Playback finished.");
+}
+
+void handleWebSocketData(AsyncWebSocketClient *client, void *arg, uint8_t *data, size_t len) {
+    String msg = (char*)data;
+    
+    // --- Joystick Command Parsing and Action (Continuous Input) ---
+    if (msg.startsWith("J:")) {
+        // Format: J:X1,Y1,X2,Y2
+        int p1 = msg.indexOf(',');
+        int p2 = msg.indexOf(',', p1 + 1);
+        int p3 = msg.indexOf(',', p2 + 1);
+        
+        int x1 = msg.substring(2, p1).toInt();
+        int y1 = msg.substring(p1 + 1, p2).toInt();
+        int x2 = msg.substring(p2 + 1, p3).toInt();
+        int y2 = msg.substring(p3 + 1).toInt();
+        
+        // Map Joystick values (0-1023) to Servo Pulse (500-2500 us)
+        motor_locs[0] = map(x1, 0, 1023, 500, 2500); // Servo 0 (Base)
+        motor_locs[1] = map(y1, 0, 1023, 500, 2500); // Servo 1 (Shoulder)
+        motor_locs[2] = map(x2, 0, 1023, 500, 2500); // Servo 2 (Elbow)
+        motor_locs[3] = map(y2, 0, 1023, 500, 2500); // Servo 3 (Wrist Rotate)
+        
+        // Send command to servos (only controlled joints 0-3)
+        for (int i = 0; i < 4; i++) {
+            sendServoPulse(servoChannels[i], motor_locs[i]);
+        }
+
+    // --- Record Button Command (Digital State Mapping) ---
+    } else if (msg.equals("REC_START")) { // Web button pressed to START (like buttonState == LOW)
+        positionCount = 0;
+        isRecording = true;
+        Serial.println("WEB: Recording Started.");
+        
+    } else if (msg.equals("REC_STOP")) { // Web button released/toggled to STOP (like buttonState != LOW)
+        isRecording = false;
+        Serial.printf("WEB: Recording Stopped. %d positions saved.\n", positionCount);
+        
+    } else if (msg.equals("PLAY")) { // Playback Button Press
+        if (positionCount > 0) {
+            playBackPositions();
+        } else {
+            Serial.println("WEB: No steps recorded to play.");
+        }
+    }
+}
