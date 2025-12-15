@@ -1,0 +1,541 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <esp_now.h>
+#include <LiquidCrystal_I2C.h>
+
+// ====================================================================
+//                          1. CORE CONFIGURATION
+// ====================================================================
+
+// --- 1.1 MAC ADDRESSES ---
+uint8_t robotMacAddress[] = {0xEC, 0xFA, 0xBC, 0xD6, 0x7E, 0x0D}; // NodeMCU V3 (Robot)
+
+// --- 1.2 PIN DEFINITIONS (UNCHANGED) ---
+const int J1_X_PIN = 1;      // Pin 1: Analog Input (J1-X)
+const int J1_Y_PIN = 2;      // Pin 2: Analog Input (J1-Y)
+const int J2_X_PIN = 6;      // Pin 6: Analog Input (J2-X)
+const int J2_Y_PIN = 7;      // Pin 7: Analog Input (J2-Y)
+
+const int BUTTON_SCROLL_UP = 3;   // Pin 3: J1 SW1 (Scroll)
+const int LCD_SDA_PIN = 4;        // Pin 4: I2C SDA
+const int LCD_SCL_PIN = 5;        // Pin 5: I2C SCL
+const int LCD_ADDRESS = 0x27;     // Common I2C Address
+
+const int BUTTON_SELECT = 8;      // Pin 8: J2 SW2 (Select/Enter)
+const int BUTTON_LAST_STEP_PIN = 9;   // Pin 9: Button 4 (Last Step)
+const int BUTTON_STOP_PIN = 10;       // Pin 10: Button 5 (Stop/Rec Stop)
+const int BUTTON_SEQ_SCROLL = 11;     // Pin 11: Button 6 (Sequence Scroll)
+const int BUTTON_SEQ_SELECT = 12;     // Pin 12: Button 7 (Sequence Select)
+
+// --- 1.3 Communication Structures (MUST MATCH NodeMCU) ---
+typedef struct ControlMessage {
+    int motor_pulses[4];
+    int recordCommand;   // 0: None, 1: REC_START, 2: REC_STOP, 3: PLAY, 4: GOTO_LAST_STEP
+} ControlMessage;
+ControlMessage outputData; 
+
+typedef struct StatusMessage {
+    int status_code;        // 0: OK, 1: I2C_FAIL, 2: LOW_VOLTAGE
+    int current_positions[4]; 
+    int recording_steps;    
+} StatusMessage;
+StatusMessage robotStatus; 
+
+// --- 1.4 Global State ---
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2); 
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+unsigned long lastWebPacketTime = 0;
+bool isPeerConnected = false; // Safesail: Track ESP-NOW peer status
+
+// Menu State Machine
+int menuState = 0; // 0: Menu, 1: Operational Status, 2: Memory View, 3: WiFi Debug/Virtual Control
+const char* menuItems[] = {"Operational Status", "Memory View", "WiFi Remote Control", "Reconfigure ESP-NOW"};
+const int numMenuItems = 4;
+int menuScrollIndex = 0;
+
+// Recording and Sequence Management
+int activeSequence = 1; 
+int sequenceSteps[5] = {0, 15, 30, 45, 60}; 
+int currentMemorySequence = 1; 
+
+int web_motor_pulses[4] = {1500, 1500, 1500, 1500}; 
+int phys_motor_pulses[4] = {1500, 1500, 1500, 1500}; 
+
+// --- 1.5 Static IP Configuration (Open AP) ---
+IPAddress AP_LOCAL_IP(192, 168, 4, 1);
+IPAddress AP_GATEWAY_IP(192, 168, 4, 1);
+IPAddress AP_NETWORK_MASK(255, 255, 255, 0);
+
+// ====================================================================
+//                          2. WEB PAGE HTML (VIRTUAL JOYSTICKS)
+// ====================================================================
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robot Command Hub</title>
+<style>
+body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 0; background-color: #222; color: #eee; }
+.container { display: flex; justify-content: space-around; flex-wrap: wrap; padding: 10px; }
+.joystick-container { width: 45vw; max-width: 200px; height: 45vw; max-height: 200px; background-color: #333; border-radius: 5px; margin: 10px; position: relative; }
+.button-container { width: 100%; display: flex; justify-content: space-around; margin-top: 20px; }
+.ctrl-btn { padding: 10px 15px; background-color: #555; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 5px; }
+.ctrl-btn.menu-btn { background-color: #00bcd4; color: #111; font-weight: bold; }
+.ctrl-btn:active { background-color: #777; }
+.label { margin-top: 5px; font-size: 14px; color: #bbb; }
+.joystick {
+    position: absolute; top: 50%; left: 50%; width: 100px; height: 100px;
+    transform: translate(-50%, -50%); border-radius: 50%; background: #444;
+    border: 2px solid #555; touch-action: none;
+}
+.joystick-handle {
+    position: absolute; top: 50%; left: 50%; width: 40px; height: 40px;
+    transform: translate(-50%, -50%); border-radius: 50%; background: #ff9800; /* Orange handle */
+}
+#menu-display { width: 90%; max-width: 400px; margin: 20px auto; padding: 10px; border: 1px solid #444; border-radius: 5px; text-align: left; background-color: #333; }
+#menu-display div { padding: 5px 0; border-bottom: 1px solid #444; cursor: pointer; }
+#menu-display div:last-child { border-bottom: none; }
+#menu-display div:hover { background-color: #444; }
+#menu-display .selected { background-color: #00bcd4; color: #111; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Remote Hub Control</h1>
+
+<div id="menu-section">
+    <h2>LCD Menu Mirror</h2>
+    <div id="menu-display">
+        </div>
+    <button class="ctrl-btn menu-btn" onclick="sendCommand('SCROLL')">Scroll Down</button>
+    <button class="ctrl-btn menu-btn" onclick="sendCommand('SELECT')">Select/Enter</button>
+    <button class="ctrl-btn menu-btn" onclick="sendCommand('EXIT')">Exit Menu</button>
+</div>
+
+<div id="controls-section" style="display:none;">
+    <h2>Virtual Joysticks</h2>
+    <div class="container">
+        <div class="joystick-container" id="left-joy">
+            <div class="joystick">
+                <div class="joystick-handle" id="left-handle"></div>
+            </div>
+        </div>
+        <div class="joystick-container" id="right-joy">
+            <div class="joystick">
+                <div class="joystick-handle" id="right-handle"></div>
+            </div>
+        </div>
+    </div>
+    <div class="button-container">
+        <button class="ctrl-btn" onclick="sendCommand('REC_START')">REC START (Phys 8)</button>
+        <button class="ctrl-btn" onclick="sendCommand('REC_STOP')">REC STOP (Phys 9)</button>
+        <button class="ctrl-btn" onclick="sendCommand('PLAY')">PLAY SEQ (Phys 10)</button>
+        <button class="ctrl-btn" onclick="sendCommand('LAST_STEP')">LAST STEP (Phys 11)</button>
+    </div>
+</div>
+
+<div id="status" class="label">Status: Connecting...</div>
+
+<script>
+var ws;
+var isConnected = false;
+var currentMenuState = 0; // 0: Menu, 1: Operational, 2: Memory, 3: WiFi Debug (Remote)
+var menuItemsArray = ["Operational Status", "Memory View", "WiFi Remote Control", "Reconfigure ESP-NOW"];
+
+function initWebSocket() {
+    ws = new WebSocket('ws://' + window.location.host + '/ws');
+    ws.onopen = function() {
+        console.log('Connected to WebSocket');
+        isConnected = true;
+        document.getElementById('status').innerText = 'Status: Connected';
+        requestSync(); // Request initial menu state
+    };
+    ws.onclose = function() {
+        console.log('WebSocket connection closed');
+        isConnected = false;
+        document.getElementById('status').innerText = 'Status: Disconnected';
+        setTimeout(initWebSocket, 2000); // Reconnect
+    };
+    ws.onmessage = function(event) {
+        // Receive Sync data from ESP32
+        let msg = event.data;
+        if (msg.startsWith('SYNC:')) {
+            let parts = msg.substring(5).split(',');
+            currentMenuState = parseInt(parts[0]);
+            let scrollIndex = parseInt(parts[1]);
+            
+            updateMenuDisplay(scrollIndex);
+            
+            // Show/Hide controls based on menu state
+            if (currentMenuState === 3) {
+                document.getElementById('controls-section').style.display = 'flex';
+                document.getElementById('menu-section').style.display = 'none';
+            } else {
+                document.getElementById('controls-section').style.display = 'none';
+                document.getElementById('menu-section').style.display = 'block';
+            }
+        }
+    };
+}
+
+function requestSync() {
+    if (isConnected) ws.send('REQ:SYNC');
+}
+
+function sendCommand(cmd) {
+    if (isConnected) {
+        ws.send('CMD:' + cmd);
+        console.log('Sent Command: ' + cmd);
+        // Force sync after a command that might change state
+        if (cmd === 'SCROLL' || cmd === 'SELECT' || cmd === 'EXIT') {
+            setTimeout(requestSync, 100);
+        }
+    }
+}
+
+function updateMenuDisplay(scrollIndex) {
+    const display = document.getElementById('menu-display');
+    display.innerHTML = '';
+    
+    // Display full menu options
+    menuItemsArray.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.innerText = (index + 1) + ") " + item;
+        if (index === scrollIndex) {
+            div.className = 'selected';
+        }
+        display.appendChild(div);
+    });
+}
+
+// ================= Joystick Logic (UNCHANGED) =================
+function setupJoystick(joyId, handleId, joyIndex) {
+    const container = document.getElementById(joyId);
+    const handle = document.getElementById(handleId);
+    // ... (rest of the joystick movement logic is identical to previous version) ...
+    const containerRect = container.getBoundingClientRect();
+    const radius = containerRect.width / 2;
+    
+    function moveHandle(e) {
+        e.preventDefault();
+        let clientX = e.clientX || e.touches[0].clientX;
+        let clientY = e.clientY || e.touches[0].clientY;
+
+        let x = clientX - (containerRect.left + radius);
+        let y = clientY - (containerRect.top + radius);
+
+        let distance = Math.sqrt(x*x + y*y);
+        if (distance > radius) {
+            x *= radius / distance;
+            y *= radius / distance;
+        }
+
+        handle.style.left = (x + radius) + 'px';
+        handle.style.top = (y + radius) + 'px';
+
+        let mappedX = Math.round(map(x, -radius, radius, 0, 1023));
+        let mappedY = Math.round(map(y, -radius, radius, 0, 1023));
+
+        sendJoystickData(joyIndex, mappedX, mappedY);
+    }
+
+    function stopMove() {
+        handle.style.left = '50%';
+        handle.style.top = '50%';
+        sendJoystickData(joyIndex, 512, 512);
+        document.removeEventListener('mousemove', moveHandle);
+        document.removeEventListener('mouseup', stopMove);
+        document.removeEventListener('touchmove', moveHandle);
+        document.removeEventListener('touchend', stopMove);
+    }
+
+    container.addEventListener('mousedown', (e) => {
+        document.addEventListener('mousemove', moveHandle);
+        document.addEventListener('mouseup', stopMove);
+        moveHandle(e);
+    });
+
+    container.addEventListener('touchstart', (e) => {
+        document.addEventListener('touchmove', moveHandle);
+        document.addEventListener('touchend', stopMove);
+        moveHandle(e);
+    });
+}
+
+function map(value, fromLow, fromHigh, toLow, toHigh) {
+    return (value - fromLow) * (toHigh - toLow) / (fromHigh - fromLow) + toLow;
+}
+
+var joystickValues = [512, 512, 512, 512]; 
+var lastSend = 0;
+
+function sendJoystickData(index, x, y) {
+    if (index === 0) {
+        joystickValues[0] = x;
+        joystickValues[1] = y;
+    } else {
+        joystickValues[2] = x;
+        joystickValues[3] = y;
+    }
+
+    if (currentMenuState === 3 && isConnected && (Date.now() - lastSend > 50)) {
+        ws.send('V:' + joystickValues.join(','));
+        lastSend = Date.now();
+    }
+}
+
+window.onload = function() {
+    initWebSocket();
+    setupJoystick('left-joy', 'left-handle', 0);
+    setupJoystick('right-joy', 'right-handle', 1);
+    // Request initial sync every 1 second until connected
+    setInterval(requestSync, 1000); 
+};
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ====================================================================
+//                          3. MENU & DISPLAY FUNCTIONS
+// ====================================================================
+
+// Helper function to re-attempt ESP-NOW peer setup
+void reconfigureEspNow() {
+    esp_now_del_peer(robotMacAddress);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, robotMacAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        Serial.println("ESP-NOW Peer Reconfigured Successfully.");
+        isPeerConnected = true;
+    } else {
+        Serial.println("Failed to Reconfigure ESP-NOW Peer.");
+        isPeerConnected = false;
+    }
+}
+
+
+// --- Menu Drawing Functions (Updated for Clarity and Spacing) ---
+void drawMenu() {
+    lcd.clear();
+    // Line 1: Displays the currently selected menu item
+    lcd.setCursor(0, 0);
+    lcd.print(">");
+    // Print item with correct spacing
+    lcd.print(menuItems[menuScrollIndex]); 
+    
+    // Line 2: Displays the connection status (Safesail Check)
+    lcd.setCursor(0, 1);
+    lcd.print("ROBOT STATUS: ");
+    if (robotStatus.status_code == 0) {
+        lcd.print("CONNECTED");
+    } else if (robotStatus.status_code == 1) {
+        lcd.print("I2C FAIL");
+    } else {
+        lcd.print("NO LINK");
+    }
+}
+
+void drawOperationalStatus() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.printf("SEQ:%d MOVES:%d", activeSequence, robotStatus.recording_steps);
+    
+    lcd.setCursor(0, 1);
+    lcd.print("EXIT (J2-SW) ");
+    lcd.print("STOP (10)");
+}
+
+void handleMenuInput() {
+    // Read physical inputs
+    bool scrollDown = (digitalRead(BUTTON_SCROLL_UP) == LOW);
+    bool select = (digitalRead(BUTTON_SELECT) == LOW);
+    
+    static unsigned long lastInputTime = 0;
+    if (millis() - lastInputTime < 200) return; // Debounce physical inputs
+
+    // --- Core State Transition/Action Logic ---
+    if (select) {
+        lastInputTime = millis();
+        // State Exit Logic (from any state back to Menu)
+        if (menuState != 0) {
+            menuState = 0;
+            drawMenu();
+            return;
+        }
+
+        // State Entry Logic (from Menu State 0)
+        if (menuScrollIndex == 0) { menuState = 1; drawOperationalStatus(); } // Operational
+        else if (menuScrollIndex == 1) { menuState = 2; drawMemoryView(); }     // Memory View (Unchanged logic)
+        else if (menuScrollIndex == 2) { // WiFi Remote Control
+            menuState = 3; 
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Web Remote Active");
+            lcd.setCursor(0, 1);
+            lcd.print(WiFi.softAPIP()); 
+        }
+        else if (menuScrollIndex == 3) { // Reconfigure ESP-NOW
+            reconfigureEspNow(); // Attempt reconnection
+            // Stay in menu state to show result on screen
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Reconnecting...");
+            lcd.setCursor(0, 1);
+            lcd.print(isPeerConnected ? "SUCCESS!" : "FAILED.");
+            delay(1000);
+            drawMenu();
+        }
+    }
+    
+    // --- Scroll Logic (Menu State 0 only) ---
+    if (menuState == 0 && scrollDown) {
+        menuScrollIndex = (menuScrollIndex + 1) % numMenuItems;
+        drawMenu();
+        lastInputTime = millis();
+    }
+    
+    // --- Command Logic (Operational & Remote Mode) ---
+    if (menuState == 1 || menuState == 3) {
+        // Physical Buttons still functional
+        if (digitalRead(BUTTON_LAST_STEP_PIN) == LOW) { outputData.recordCommand = 4; lastInputTime = millis(); }
+        if (digitalRead(BUTTON_STOP_PIN) == LOW) { outputData.recordCommand = 2; lastInputTime = millis(); }
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// ------------------------------ ESP-NOW & WEB CALLBACKS --------------------------
+// ---------------------------------------------------------------------------------
+
+void handleWebSocketData(AsyncWebSocketClient *client, void *arg, uint8_t *data, size_t len) {
+    String msg = (char*)data;
+    
+    if (msg.startsWith("V:")) { // VIRTUAL Joystick Data (Unchanged)
+        int p1 = msg.indexOf(','); int p2 = msg.indexOf(',', p1 + 1); int p3 = msg.indexOf(',', p2 + 1);
+        web_motor_pulses[0] = map(msg.substring(2, p1).toInt(), 0, 1023, 500, 2500); 
+        web_motor_pulses[1] = map(msg.substring(p1 + 1, p2).toInt(), 0, 1023, 500, 2500); 
+        web_motor_pulses[2] = map(msg.substring(p2 + 1, p3).toInt(), 0, 1023, 500, 2500);
+        web_motor_pulses[3] = map(msg.substring(p3 + 1).toInt(), 0, 1023, 500, 2500);
+        lastWebPacketTime = millis(); 
+
+    } else if (msg.startsWith("CMD:")) { // Remote Command from Web UI (New Menu Commands)
+        String cmd = msg.substring(4);
+        
+        // Menu Control Commands
+        if (cmd.equals("SCROLL")) {
+             if (menuState == 0) menuScrollIndex = (menuScrollIndex + 1) % numMenuItems;
+             // Any non-joystick command acts like a single press, allowing physical resume.
+        } else if (cmd.equals("SELECT")) {
+             // Mimic physical select press
+             handleMenuInput(); // Re-runs the physical logic to handle state transition
+        } else if (cmd.equals("EXIT")) {
+             // Mimic physical select press to exit sub-menu
+             if (menuState != 0) { menuState = 0; drawMenu(); }
+        }
+
+        // Robot Control Commands
+        else if (cmd.equals("REC_START")) outputData.recordCommand = 1; 
+        else if (cmd.equals("REC_STOP")) outputData.recordCommand = 2; 
+        else if (cmd.equals("PLAY")) outputData.recordCommand = 3; 
+        else if (cmd.equals("LAST_STEP")) outputData.recordCommand = 4;
+
+    } else if (msg.startsWith("REQ:SYNC")) {
+        // Send current menu state and scroll index back to the client for UI sync
+        ws.text(client->id(), "SYNC:" + String(menuState) + "," + String(menuScrollIndex));
+    }
+}
+
+
+// ---------------------------------------------------------------------------------
+// ------------------------------ SETUP AND LOOP -----------------------------------
+// ---------------------------------------------------------------------------------
+
+void setup() {
+    Serial.begin(115200);
+    // ... (Setup: LCD, PinMode, WiFi AP Config, ESP-NOW Init - All identical to previous working version)
+    
+    Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN); 
+    lcd.init(); lcd.backlight();
+    lcd.setCursor(0, 0); lcd.print("ESP32-S3 Starting..."); delay(2000); 
+    
+    pinMode(BUTTON_SCROLL_UP, INPUT_PULLUP);
+    pinMode(BUTTON_SELECT, INPUT_PULLUP);
+    pinMode(BUTTON_LAST_STEP_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_STOP_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_SEQ_SCROLL, INPUT_PULLUP);
+    pinMode(BUTTON_SEQ_SELECT, INPUT_PULLUP);
+    
+    WiFi.mode(WIFI_AP_STA); 
+    WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY_IP, AP_NETWORK_MASK);
+    WiFi.softAP("Robot_Control_Hub", nullptr); // No password
+    
+    if (esp_now_init() != ESP_OK) { Serial.println("Error initializing ESP-NOW"); return; }
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv); 
+    
+    reconfigureEspNow(); // Initial connection attempt using the new function
+
+    // --- Web Server Setup ---
+    ws.onEvent([](AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+        if(type == WS_EVT_CONNECT) { Serial.println("Web Client Connected"); } 
+        else if(type == WS_EVT_DATA){ handleWebSocketData(client, arg, data, len); }
+    });
+    server.addHandler(&ws);
+
+    // Serve the virtual joystick page only when in WiFi Debug/Virtual Control Mode
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", index_html); // Always serve the client-side code
+    });
+
+    server.begin();
+    
+    drawMenu();
+}
+
+void loop() {
+    ws.cleanupClients();
+    
+    // 1. Handle Menu and Physical Button Inputs
+    handleMenuInput(); 
+
+    // 2. Read Physical Joysticks 
+    // ... (Reading logic is unchanged) ...
+    phys_motor_pulses[0] = map(analogRead(J1_X_PIN), 0, 4095, 500, 2500);
+    phys_motor_pulses[1] = map(analogRead(J1_Y_PIN), 0, 4095, 500, 2500);
+    phys_motor_pulses[2] = map(analogRead(J2_X_PIN), 0, 4095, 500, 2500);
+    phys_motor_pulses[3] = map(analogRead(J2_Y_PIN), 0, 4095, 500, 2500);
+
+    // 3. Determine Control Source (PHYSICAL TAKES PRIORITY)
+    // ... (Control logic is unchanged, PHYSICAL overrides WEB) ...
+    bool physicalMoved = false;
+    for (int i = 0; i < 4; i++) {
+        if (abs(phys_motor_pulses[i] - 1500) > 20) {
+            physicalMoved = true;
+            break;
+        }
+    }
+    bool webActive = (millis() - lastWebPacketTime < 500) && (menuState == 3); // Web only active in Mode 3
+
+    // 4. Populate ESP-NOW Output Data
+    if (physicalMoved) {
+        memcpy(outputData.motor_pulses, phys_motor_pulses, sizeof(phys_motor_pulses));
+        outputData.recordCommand = 0; 
+    } else if (webActive) {
+        memcpy(outputData.motor_pulses, web_motor_pulses, sizeof(web_motor_pulses));
+    } else {
+        outputData.motor_pulses[0] = outputData.motor_pulses[1] = outputData.motor_pulses[2] = outputData.motor_pulses[3] = 1500;
+    }
+    
+    // 5. Transmit Control Data via ESP-NOW
+    if (isPeerConnected) { // Safesail: Only send if peer is known to be connected
+      esp_now_send(robotMacAddress, (uint8_t *) &outputData, sizeof(outputData));
+    }
+    
+    delay(50); // Control loop at 20Hz
+}
