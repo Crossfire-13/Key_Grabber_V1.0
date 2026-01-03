@@ -1,6 +1,6 @@
 # 🦾 AL5D "Key Grabber" - Wireless Teleoperation System
 ### UFMFV8-15-3 Group Design and Integration Project
-**Student Submission: Crossfire-13**
+**Student Submission - GDIP**
 
 ---
 
